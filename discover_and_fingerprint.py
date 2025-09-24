@@ -1,23 +1,18 @@
 #!/usr/bin/env python3
 """
-discover_and_fingerprint.py
-
-Improved discovery & fingerprinting with stronger OS detection.
+discover_and_fingerprint.py (hostname + robust XML + wrapped PDF)
 
 Usage:
     python3 discover_and_fingerprint.py
 or
     python3 discover_and_fingerprint.py -i ip_list.txt -o results_dir
 
-Notes:
- - For best OS detection run as root/administrator (sudo).
- - This script:
-    * runs an initial discovery (-sn using ICMP + TCP probes)
-    * for hosts found -> runs a strong detailed scan with OS detection (-O --osscan-guess, version probes, useful scripts)
-    * for hosts not found -> runs a -Pn quick probe on common ports to catch ICMP-blocked hosts
-    * extracts IP, hostname(s), OS, MAC vendor, open ports, scripts outputs
-    * applies heuristics to guess device type
-    * writes results to CSV and a wrapped PDF, saves per-host nmap XMLs and nmap stderr logs
+Outputs:
+  - results_dir/results.csv
+  - results_dir/report.pdf
+  - results_dir/nmap_discovery.xml
+  - results_dir/detailed_scans/*.xml
+  - results_dir/logs/*.stderr.txt
 """
 import os
 import sys
@@ -35,14 +30,13 @@ from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.units import mm
 
 # ---------- Configuration ----------
-DISCOVERY_PORTS = "22,80,443,3389,161"  # used for -PS probes in discovery and -Pn quick probes
-DETAILED_PORT_RANGE = "1-1024"          # used for deep OS detection (slower but more accurate)
-DETAILED_SCRIPTS = "smb-os-discovery,snmp-info,ssh-hostkey,banner,http-title"
+COMMON_PORTS = "22,80,443,3389,161"
+DETAIL_SCRIPTS = "banner,snmp-info,http-title"
 MIN_XML_BYTES = 200  # minimal bytes for a usable nmap XML
 
-# ---------- Helpers ----------
+# ---------- Utilities ----------
 def run_cmd(cmd, capture_output=True):
-    """Run command and return (stdout, stderr, rc). Print summary to stdout."""
+    """Run command and return (stdout, stderr, rc). Print debug summary."""
     print("RUN:", " ".join(cmd))
     p = subprocess.run(cmd, stdout=subprocess.PIPE if capture_output else None,
                        stderr=subprocess.PIPE if capture_output else None, text=True)
@@ -68,7 +62,6 @@ def is_root():
     try:
         return os.geteuid() == 0
     except AttributeError:
-        # Windows or platform without geteuid
         return False
 
 def xml_file_ok(path):
@@ -81,17 +74,17 @@ def save_log(outdir, name, content):
         f.write(content or '')
     return path
 
-# ---------- XML helpers tolerant of namespaces ----------
+# ---------- XML helpers with namespace tolerance ----------
 def findall_ns(elem, tag_localname):
     return elem.findall('.//{*}' + tag_localname)
 
 def find_ns(elem, tag_localname):
     return elem.find('.//{*}' + tag_localname)
 
-# ---------- Parsing functions ----------
+# ---------- Parse discovery XML for up hosts ----------
 def parse_nmap_xml_for_up_hosts(xmlfile):
     if not xml_file_ok(xmlfile):
-        print(f"DEBUG: discovery XML '{xmlfile}' missing/too-small ({os.path.getsize(xmlfile) if os.path.exists(xmlfile) else 'nofile'})")
+        print(f"DEBUG: discovery XML '{xmlfile}' missing/too small ({os.path.getsize(xmlfile) if os.path.exists(xmlfile) else 'nofile'})")
         return {}
     try:
         tree = ET.parse(xmlfile)
@@ -115,6 +108,7 @@ def parse_nmap_xml_for_up_hosts(xmlfile):
             up_hosts[addr] = {'vendor': vendor, 'raw': ET.tostring(host, encoding='unicode')}
     return up_hosts
 
+# ---------- Parse detailed nmap XML (extract hostname too) ----------
 def parse_detailed_nmap_xml(xmlfile):
     """
     Return dict: ip -> info where info contains:
@@ -139,7 +133,7 @@ def parse_detailed_nmap_xml(xmlfile):
                 ip = a.get('addr')
             if a.get('addrtype') == 'mac' and a.get('vendor'):
                 mac_vendor = a.get('vendor')
-        # hostnames
+        # hostnames (nmap puts them under <hostnames><hostname name="..." /> )
         hostnames_node = host.find('{*}hostnames')
         if hostnames_node is not None:
             for hn in host.findall('.//{*}hostname'):
@@ -166,9 +160,10 @@ def parse_detailed_nmap_xml(xmlfile):
                 svcname = serviceNode.get('name') if serviceNode is not None else None
                 banner = serviceNode.get('product') if serviceNode is not None and serviceNode.get('product') else None
                 info['ports'].append({'port': portnum, 'proto': proto, 'state': state, 'service': svcname, 'banner': banner})
+                # port-level scripts
                 for s in p.findall('{*}script'):
                     info['script'][s.get('id')] = s.get('output')
-        # host-level scripts
+        # hostscript-level scripts
         hostscript = find_ns(host, 'hostscript')
         if hostscript is not None:
             for s in hostscript.findall('{*}script'):
@@ -176,7 +171,7 @@ def parse_detailed_nmap_xml(xmlfile):
         hosts[ip] = info
     return hosts
 
-# ---------- Heuristics ----------
+# ---------- Heuristics (unchanged logic, compact) ----------
 def heuristic_guess_type(dinfo):
     pv = (dinfo.get('mac_vendor') or '').lower()
     osname = (dinfo.get('os') or '').lower()
@@ -243,6 +238,7 @@ def make_pdf_report(rows, outpdf):
 
     page_w, page_h = A4
     usable_w = page_w - (15*mm*2)
+    # allocate reasonably sized columns; type/os bigger
     col_widths = [
         30*mm,  # IP
         55*mm,  # Hostname
@@ -267,9 +263,9 @@ def make_pdf_report(rows, outpdf):
     story.append(t)
     doc.build(story)
 
-# ---------- Main ----------
+# ---------- Main flow ----------
 def main():
-    parser = argparse.ArgumentParser(description="Discover alive hosts and fingerprint them (strong OS detection).")
+    parser = argparse.ArgumentParser(description="Discover alive hosts and fingerprint them (hostname included).")
     parser.add_argument('-i', '--input', default='ip_list.txt', help='Input file (one IP per line). Default: ip_list.txt')
     parser.add_argument('-o', '--out', default='results_dir', help='Output directory. Default: results_dir')
     parser.add_argument('--yes-root', action='store_true', help='Suppress root-warning if not root')
@@ -277,7 +273,9 @@ def main():
 
     check_nmap()
     if not is_root() and not args.yes_root:
-        print("WARNING: You are not running as root/administrator. Run as root (sudo) for best OS detection. Continuing without root...")
+        print("WARNING: You are not running as root/administrator. Some nmap features (ARP discovery, accurate OS detection) may be less effective.")
+        print("If you want to proceed anyway and suppress this message next time, re-run with --yes-root.")
+        print("Continuing without root...")
 
     ipfile = args.input
     outdir = args.out
@@ -292,9 +290,9 @@ def main():
     with open(ipfile) as f:
         ips = [line.strip() for line in f if line.strip()]
 
-    # 1) Discovery scan (ping + TCP probes)
+    # Discovery scan
     discovery_xml = os.path.join(outdir, "nmap_discovery.xml")
-    cmd = ["nmap", "-sn", "-PE", "-PS" + DISCOVERY_PORTS, "-PA", "-oX", discovery_xml, "-iL", ipfile]
+    cmd = ["nmap", "-sn", "-PE", "-PS"+COMMON_PORTS, "-PA", "-oX", discovery_xml, "-iL", ipfile]
     stdout, stderr, rc = run_cmd(cmd)
     if rc != 0:
         save_log(outdir, "nmap_discovery.stderr.txt", stderr)
@@ -313,28 +311,16 @@ def main():
         print("Processing", ip)
         entry = {'ip': ip, 'hostname': '', 'alive': False, 'icmp_blocked': False, 'type_guess': '', 'os': None, 'mac_vendor': None, 'open_ports': '', 'scan_xml': ''}
         if ip in up_hosts:
-            # Host discovered via discovery; run strong OS detection detailed scan
             entry['alive'] = True
             xmlout = os.path.join(outdir, 'detailed_scans', f"{ip.replace(':','_')}.xml")
-            # STRONG OS detection command (requires root for best results)
-            cmd = [
-                "nmap",
-                "-O", "--osscan-guess",
-                "-sS", "-sV", "--version-all",
-                "-p", DETAILED_PORT_RANGE,
-                "--script", DETAILED_SCRIPTS,
-                "--traceroute",
-                "-oX", xmlout,
-                ip
-            ]
+            cmd = ["nmap", "-sS", "-sV", "-O", "--script="+DETAIL_SCRIPTS, "-p", COMMON_PORTS, "-oX", xmlout, ip]
             stdout, stderr, rc = run_cmd(cmd)
             if rc != 0:
                 save_log(outdir, f"{ip}_detailed.stderr.txt", stderr)
-            # if XML missing, fallback to a -Pn probe on common ports
             if not xml_file_ok(xmlout):
-                print(f"WARNING: detailed XML for {ip} missing/too-small. Falling back to -Pn quick probe.")
+                print(f"WARNING: detailed XML for {ip} missing/too small. Will fallback to -Pn probe.")
                 xmlout_pn = os.path.join(outdir, 'detailed_scans', f"{ip.replace(':','_')}_fallback_pn.xml")
-                run_cmd(["nmap", "-Pn", "-sS", "-p", DISCOVERY_PORTS, "-oX", xmlout_pn, ip])
+                run_cmd(["nmap", "-Pn", "-sS", "-p", COMMON_PORTS, "-oX", xmlout_pn, ip])
                 if xml_file_ok(xmlout_pn):
                     xmlout = xmlout_pn
             entry['scan_xml'] = xmlout if os.path.exists(xmlout) else ''
@@ -345,9 +331,9 @@ def main():
             entry['open_ports'] = ",".join([p['port'] for p in dinfo.get('ports', []) if p['state'] in ('open', 'open|filtered')])
             entry['type_guess'] = heuristic_guess_type(dinfo) if dinfo else 'Unknown'
         else:
-            # Not found in discovery => try -Pn quick probe to detect ICMP-blocked hosts
+            # Not found in discovery; do -Pn quick probe
             xmlout = os.path.join(outdir, 'detailed_scans', f"{ip.replace(':','_')}_pn.xml")
-            stdout, stderr, rc = run_cmd(["nmap", "-Pn", "-sS", "-p", DISCOVERY_PORTS, "-oX", xmlout, ip])
+            stdout, stderr, rc = run_cmd(["nmap", "-Pn", "-sS", "-p", COMMON_PORTS, "-oX", xmlout, ip])
             if rc != 0:
                 save_log(outdir, f"{ip}_pn.stderr.txt", stderr)
             if xml_file_ok(xmlout):
@@ -368,11 +354,12 @@ def main():
                 print(f"No XML produced for {ip} (pn probe). Check logs.")
         results.append(entry)
 
-    # Write outputs
+    # Write CSV
     csvfile = os.path.join(outdir, "results.csv")
     write_csv(results, csvfile)
     print("Wrote CSV:", csvfile)
 
+    # Write PDF
     pdffile = os.path.join(outdir, "report.pdf")
     make_pdf_report(results, pdffile)
     print("Wrote PDF:", pdffile)
